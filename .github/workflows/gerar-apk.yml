@@ -8,6 +8,9 @@ on:
 jobs:
   apk:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: BOM-App/BOM-App
     steps:
       - uses: actions/checkout@v4
 
@@ -40,4 +43,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: BOM-Organizador-APK
-          path: BOM-Organizador.apk
+          path: BOM-App/BOM-App/BOM-Organizador.apk
