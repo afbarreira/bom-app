@@ -1,0 +1,13 @@
+{
+  "appId": "br.com.bom.organizador",
+  "appName": "BOM!",
+  "webDir": "www",
+  "backgroundColor": "#0a1120",
+  "android": {
+    "backgroundColor": "#0a1120",
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "SplashScreen": { "launchShowDuration": 800, "backgroundColor": "#0a1120" }
+  }
+}
