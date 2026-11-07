@@ -117,13 +117,8 @@ const iconOf = (it, s) => it.type === 'folder' ? folderSvg(it.color, s) : fileIc
 const logo = (w = 220) => `<img class="logo" src="img/logo-bom.png" width="${w}" height="${Math.round(w * 552 / 950)}" alt="BOM!" draggable="false">`;
 
 /* ---------- IndexedDB (bytes dos arquivos importados) ---------- */
-const IDB = {
-  db: null,
-  open() { return new Promise((res, rej) => { if (this.db) return res(this.db); let r; try { r = indexedDB.open('bom_pdfs', 1); } catch (e) { return rej(e); } r.onupgradeneeded = () => r.result.createObjectStore('files'); r.onsuccess = () => { this.db = r.result; res(this.db); }; r.onerror = () => rej(r.error); }); },
-  async put(k, v) { try { const db = await this.open(); await new Promise((res, rej) => { const t = db.transaction('files', 'readwrite'); t.objectStore('files').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); } catch (e) { MEM['bin:' + k] = v; } },
-  async get(k) { if (MEM['bin:' + k]) return MEM['bin:' + k]; try { const db = await this.open(); return await new Promise((res, rej) => { const r = db.transaction('files').objectStore('files').get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); } catch (e) { return null; } },
-  async del(k) { delete MEM['bin:' + k]; try { const db = await this.open(); db.transaction('files', 'readwrite').objectStore('files').delete(k); } catch (e) {} }
-};
+/* bytes dos arquivos importados: módulo ArquivosLocais (js/persistencia.js) */
+const IDB = BOM.ArquivosLocais.bytes;
 const pdfCache = {}, URLS = {};
 function getPdf(id) {
   if (!window.pdfjsLib) return Promise.reject(new Error('pdf.js indisponível'));
@@ -158,7 +153,7 @@ function savePrefs() { LS.set(prefsKey(), {view: S.view, sort: S.sort, dir: S.di
 
 /* ---------- dados de exemplo ---------- */
 async function seed() {
-  if (LS.get('bom_seed_v1', false)) return;
+  if (BOM.nuvem || LS.get('bom_seed_v1', false)) return; // contas de teste só no modo local
   const now = Date.now(), D = 864e5;
   const mk = async (nome, email, senha, perfil, ativo, dias) => ({uid: 'u-' + uid(), nome, email, senhaHash: await hashPw(senha), perfil, ativo, dataCadastro: new Date(now - dias * D).toISOString(), dispositivos: []});
   const admin = await mk('Administrador BOM!', 'admin@bom.app', 'admin123', 'admin', true, 30);
@@ -190,8 +185,8 @@ function seedFS() {
 
 /* ---------- sistema de arquivos local (por usuário) ---------- */
 const fsKey = () => 'bom_fs2_' + S.user.uid;
-function loadFS() { S.fs = LS.get(fsKey(), null); if (!S.fs) { S.fs = seedFS(); saveFS(); } }
-function saveFS() { const ok = LS.set(fsKey(), S.fs); if (!ok) toast('Armazenamento cheio', {sub: 'A última alteração pode não ter sido salva.', err: true}); return ok; }
+function loadFS() { S.fs = BOM.ArquivosLocais.carregar(S.user.uid); if (!S.fs) { S.fs = seedFS(); saveFS(); } }
+function saveFS() { const ok = BOM.ArquivosLocais.salvar(S.user.uid, S.fs); if (!ok) toast('Armazenamento cheio', {sub: 'A última alteração pode não ter sido salva.', err: true}); return ok; }
 let _sv; const saveFSDebounced = () => { clearTimeout(_sv); _sv = setTimeout(saveFS, 600); };
 const item = id => S.fs && S.fs.items.find(i => i.id === id);
 function isTrashed(i) { let c = i, g = 0; while (c && g++ < 50) { if (c.trashed) return true; c = c.parent && item(c.parent); } return false; }
@@ -292,47 +287,61 @@ function deviceInfo() {
   const nav = /Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Navegador';
   return {idDispositivo: id, nomeDispositivo: `${/Mobi|Android|iPhone|iPad/i.test(ua) ? 'Celular' : 'Computador'} ${plat} · ${nav}`, plataforma: plat};
 }
-async function doLogin(fd) {
+const busy = (form, on, label) => { const b = form && form.querySelector('button[type=submit]'); if (b) { b.disabled = on; if (label) b.textContent = label; } };
+async function doLogin(fd, form) {
   const email = String(fd.get('email') || '').trim().toLowerCase(), senha = String(fd.get('senha') || '');
-  const u = getUsers().find(x => x.email === email);
-  const fail = m => { S.loginErr = m; const e = $('#login-err'); if (e) e.textContent = m; };
-  if (!u || u.senhaHash !== await hashPw(senha)) return fail('E-mail ou senha incorretos.');
-  if (!u.ativo) return fail('Esta conta está desativada. Fale com o administrador.');
-  if (S.adminIntent && u.perfil !== 'admin') return fail('Esta conta não tem perfil de administrador.');
-  if (fd.get('lembrar')) { LS.set('bom_lembrar', {email, senha}); LS.del('bom_lembrar_off'); } else { LS.del('bom_lembrar'); LS.set('bom_lembrar_off', true); }
-  startSession(u, S.adminIntent ? 'admin' : 'app');
+  const fail = m => { S.loginErr = m; const e = $('#login-err'); if (e) e.textContent = m; busy(form, false, S.adminIntent ? 'Entrar no painel' : 'Entrar'); };
+  busy(form, true, 'Entrando…');
+  let id, u;
+  try { id = await BOM.Autenticacao.entrar(email, senha); u = await BOM.Usuario.obter(id); }
+  catch (e) { return fail(e.message); }
+  if (!u && BOM.provedor === 'Supabase') { try { u = await BOM.Usuario.criar({uid: id, nome: null, email}); } catch (e) { console.warn(e); } } // conta confirmada por e-mail: cria o perfil no 1º login
+  if (!u) { await BOM.Autenticacao.sair(); return fail('Perfil não encontrado. Fale com o administrador.'); }
+  if (!u.ativo) { await BOM.Autenticacao.sair(); return fail('Esta conta está desativada. Fale com o administrador.'); }
+  if (S.adminIntent && u.perfil !== 'admin') { await BOM.Autenticacao.sair(); return fail('Esta conta não tem perfil de administrador.'); }
+  // modo nuvem: só o e-mail fica salvo (a sessão é guardada pelo Firebase, a senha nunca fica no app)
+  if (fd.get('lembrar')) { LS.set('bom_lembrar', BOM.nuvem ? {email} : {email, senha}); LS.del('bom_lembrar_off'); } else { LS.del('bom_lembrar'); LS.set('bom_lembrar_off', true); }
+  await startSession(u, S.adminIntent ? 'admin' : 'app');
 }
-async function doCadastro(fd) {
+async function doCadastro(fd, form) {
   const nome = String(fd.get('nome') || '').trim(), email = String(fd.get('email') || '').trim().toLowerCase(), senha = String(fd.get('senha') || ''), conf = String(fd.get('conf') || '');
-  const fail = m => { $('#cad-err').textContent = m; };
+  const fail = m => { $('#cad-err').textContent = m; busy(form, false, 'Cadastrar e entrar'); };
   if (nome.length < 3) return fail('Informe seu nome completo.');
   if (!/^\S+@\S+\.\S+$/.test(email)) return fail('Informe um e-mail válido.');
   if (senha.length < 6) return fail('A senha precisa ter pelo menos 6 caracteres.');
   if (senha !== conf) return fail('As senhas não conferem.');
-  const users = getUsers();
-  if (users.some(x => x.email === email)) return fail('Já existe uma conta com este e-mail.');
-  const u = {uid: 'u-' + uid(), nome, email, senhaHash: await hashPw(senha), perfil: 'usuario', ativo: true, dataCadastro: new Date().toISOString(), dispositivos: []};
-  users.push(u); setUsers(users); LS.set('bom_lembrar', {email, senha}); LS.del('bom_lembrar_off');
-  startSession(u, 'app');
+  busy(form, true, 'Criando conta…');
+  let u;
+  try { const id = await BOM.Autenticacao.cadastrar(email, senha, nome); u = await BOM.Usuario.criar({uid: id, nome, email}); }
+  catch (e) { return fail(e.message); }
+  LS.set('bom_lembrar', BOM.nuvem ? {email} : {email, senha}); LS.del('bom_lembrar_off');
+  await startSession(u, 'app');
 }
-function startSession(u, area) {
-  const d = deviceInfo(), now = new Date().toISOString(), users = getUsers(), uu = users.find(x => x.uid === u.uid);
-  uu.dispositivos = uu.dispositivos || [];
-  let dv = uu.dispositivos.find(x => x.idDispositivo === d.idDispositivo); if (!dv) { dv = {...d}; uu.dispositivos.push(dv); }
-  dv.nomeDispositivo = d.nomeDispositivo; dv.ultimoAcesso = now; setUsers(users);
-  const log = {idLog: 'log-' + uid(), uid: uu.uid, nomeUsuario: uu.nome, idDispositivo: d.idDispositivo, nomeDispositivo: d.nomeDispositivo, dataLogin: now, horaLogout: null, situacao: 'ativa'};
-  const logs = getLogs(); logs.push(log); setLogs(logs);
-  LS.set('bom_session', {uid: uu.uid, logId: log.idLog, area});
-  S.user = uu; S.loginErr = ''; loadFS(); loadPrefs(); Object.assign(S, {cwd: null, section: 'files', screen: area === 'admin' ? 'admin' : 'home'});
-  render(); toast(`Olá, ${esc(uu.nome.split(' ')[0])}!`, {sub: 'Sessão salva neste aparelho'});
+async function startSession(u, area) {
+  const d = deviceInfo(); let idLog = null;
+  try { await BOM.Dispositivo.registrar(u.uid, d); } catch (e) { console.warn(e); }
+  try { idLog = await BOM.LogAcesso.abrir(u, d); } catch (e) { console.warn(e); toast('Não foi possível gravar o log de acesso', {sub: esc(e.message), err: true}); }
+  LS.set('bom_session', {uid: u.uid, logId: idLog, area});
+  S.user = u; S.loginErr = ''; S.data = {}; loadFS(); loadPrefs(); Object.assign(S, {cwd: null, section: 'files', screen: area === 'admin' ? 'admin' : 'home'});
+  render(); toast(`Olá, ${esc(u.nome.split(' ')[0])}!`, {sub: BOM.nuvem ? `Conectado ao ${BOM.provedor} · sessão salva neste aparelho` : 'Sessão salva neste aparelho'});
 }
-function closeLog(logId) { const logs = getLogs(), l = logs.find(x => x.idLog === logId); if (l && !l.horaLogout) { l.horaLogout = new Date().toISOString(); l.situacao = 'encerrada'; setLogs(logs); } }
-function logout() {
-  const s = LS.get('bom_session', null); if (s) closeLog(s.logId);
+async function logout() {
+  const s = LS.get('bom_session', null);
+  if (s) await BOM.LogAcesso.fechar(s.logId);
+  await BOM.Autenticacao.sair();
   LS.del('bom_session');
-  Object.assign(S, {user: null, fs: null, open: [], floats: [], split: [], select: false, filter: '', searchOpen: false, screen: 'login', adminIntent: false, hist: {}, find: null});
+  Object.assign(S, {user: null, fs: null, open: [], floats: [], split: [], select: false, filter: '', searchOpen: false, screen: 'login', adminIntent: !!window.BOM_ADMIN_PAGE, hist: {}, find: null, data: {}});
   S.sel.clear(); closeSheet(); render(); toast('Você saiu', {sub: 'A hora de logout foi gravada no log'});
 }
+/* dados vindos da nuvem/local carregados sob demanda para as telas */
+S.data = {}; S.loading = {};
+function need(key, loader) {
+  if (S.data[key] !== undefined) return S.data[key];
+  if (!S.loading[key]) { S.loading[key] = true; loader().then(v => { S.data[key] = v; }).catch(e => { S.data[key] = {erro: String(e.message || e)}; }).finally(() => { S.loading[key] = false; render(); }); }
+  return null;
+}
+const loadingBox = t => `<div class="empty">${t || 'Carregando…'}</div>`;
+const errBox = e => `<div class="empty" style="color:#ff8a8a">Não foi possível carregar: ${esc(e)}</div>`;
 
 /* ---------- interface: toast, folhas, menus ---------- */
 let _tt;
@@ -394,7 +403,7 @@ function vLogin() {
     </form>
     ${adm ? `<button class="link center" data-act="toApp">← Voltar ao login do app</button>`
       : `<p class="muted center" style="margin:0">Não tem conta? <button class="link" data-act="go" data-to="cadastro">Cadastre-se</button></p><button class="link small center" data-act="toAdmin">Área do administrador</button>`}
-    <details class="demo"><summary>Contas de teste</summary><p>Usuário: <code>ana@bom.app</code> / <code>123456</code><br>Admin: <code>admin@bom.app</code> / <code>admin123</code><br>Desativada: <code>bruno@bom.app</code> / <code>123456</code></p></details>
+    ${BOM.nuvem ? `<p class="muted small center" style="margin:0">● Conectado à nuvem (${BOM.provedor}). Sua conta funciona em qualquer dispositivo.</p>` : `${BOM.erro ? `<p class="small center" style="margin:0;color:#ff8a8a">A nuvem não conectou: ${esc(BOM.erro)} Usando o modo local.</p>` : ""}<details class="demo"><summary>Contas de teste (modo local)</summary><p>Usuário: <code>ana@bom.app</code> / <code>123456</code><br>Admin: <code>admin@bom.app</code> / <code>admin123</code><br>Desativada: <code>bruno@bom.app</code> / <code>123456</code></p></details>`}
   </section></div></div></div>`;
 }
 function vCadastro() {
@@ -468,7 +477,8 @@ function vHome() {
 }
 
 /* ---------- leitor ---------- */
-function splitIds() { let a = (S.split || []).filter(id => S.open.includes(id)); for (const id of S.open) { if (a.length >= 2) break; if (!a.includes(id)) a.push(id); } S.split = a; return a.length < 2 ? [a[0], null] : a.slice(0, 2); }
+const splitMax = () => isDesk() ? 3 : 2;
+function splitIds() { const m = splitMax(); let a = (S.split || []).filter(id => S.open.includes(id)).slice(0, m); for (const id of S.open) { if (a.length >= 2) break; if (!a.includes(id)) a.push(id); } S.split = a; return a.length < 2 ? [a[0], null] : a; }
 function curDoc() { if (S.screen !== 'viewer') return null; return item(S.layout === 'split' ? S.focusDoc : S.active); }
 const HINTS = {hl: 'Arraste o dedo sobre o texto para realçar.', note: 'Toque onde quer deixar um comentário.', text: 'Toque onde quer inserir o texto.', pen: 'Desenhe livremente sobre a página.', erase: 'Toque em uma anotação para apagá-la.'};
 function toolbarHTML(it) {
@@ -485,13 +495,13 @@ function vViewer() {
   const split = S.layout === 'split', ids = split ? splitIds() : null;
   if (split) { if (!ids.includes(S.focusDoc)) S.focusDoc = ids[0]; } else S.focusDoc = S.active;
   const it = item(S.active), fd = item(S.focusDoc) || it, h = S.hist[fd.id];
-  const bar = `<header class="appbar vbar"><button class="ib" data-act="go" data-to="home" aria-label="Voltar">${ic('arrowL')}</button><div class="ttl"><b>${split ? 'Tela dividida' : esc(it.name)}</b><small id="vsub">${split ? 'Toque em um painel para editá-lo' : ''}</small></div>
+  const bar = `<header class="appbar vbar"><button class="ib" data-act="go" data-to="home" aria-label="Voltar">${ic('arrowL')}</button><div class="ttl"><b>${split ? 'Tela dividida' : esc(it.name)}</b><small id="vsub">${split ? (isDesk() ? 'Até 3 documentos lado a lado · use + para adicionar' : 'Toque em um painel para editá-lo') : ''}</small></div>
     ${split ? `<button class="ib" data-act="splitDir" aria-label="Orientação">${ic(S.splitDir === 'cols' ? 'rows' : 'cols')}</button><button class="ib on" data-act="toggleSplit" aria-label="Sair da tela dividida">${ic('split')}</button>` : ''}
     <button class="ib" data-act="undo" ${h && h.u.length ? '' : 'disabled'} aria-label="Desfazer">${ic('undo')}</button><button class="ib" data-act="redo" ${h && h.r.length ? '' : 'disabled'} aria-label="Refazer">${ic('redo')}</button><button class="ib" data-act="viewerMenu" aria-label="Mais">${ic('more')}</button></header>`;
   const tabs = `<div class="tabs">${S.open.map(id => `<div class="tab ${id === S.active && !split ? 'on' : ''}" data-act="tab" data-id="${id}">${fileIcon(item(id), 18)}<span class="ell">${esc(item(id).name)}</span><button data-act="closeTab" data-id="${id}" aria-label="Fechar aba">${ic('close', 14)}</button></div>`).join('')}<button class="tab add" data-act="addTab" aria-label="Abrir outro">${ic('plus', 16)}</button></div>`;
   const hint = HINTS[S.tool] && S.vmode !== 'main' ? `<div class="hint">${ic(S.tool === 'erase' ? 'eraser' : S.tool === 'pen' ? 'pen' : S.tool, 16)}<span>${HINTS[S.tool]}</span></div>` : S.find && (split ? ids.includes(S.find.doc) : S.find.doc === it.id) ? `<div class="hint">${ic('search', 16)}<span>Buscando “${esc(S.find.term)}”</span><button data-act="findClear">Limpar</button></div>` : '';
   if (split) {
-    return `<div class="screen viewer">${bar}${tabs}<div class="vwrap ${S.night ? 'night' : ''}">${hint}<div class="split ${S.splitDir}">${ids.map((id, k) => id ? `<section class="pane ${id === S.focusDoc ? 'focus' : ''}" data-pane="${k}"><div class="pane-h"><div class="pn">${fileIcon(item(id), 18)}<span class="ell">${esc(item(id).name)}</span>${ic('chevDown', 14)}<select data-pane-sel="${k}" aria-label="Trocar documento">${S.open.map(o => `<option value="${o}" ${o === id ? 'selected' : ''}>${esc(item(o).name)}</option>`).join('')}</select></div><button class="ib xs" data-act="closePane" data-k="${k}" aria-label="Fechar painel">${ic('close', 14)}</button></div>
+    return `<div class="screen viewer">${bar}${tabs}<div class="vwrap ${S.night ? 'night' : ''}">${hint}<div class="split ${S.splitDir}" style="--n:${ids.length}">${ids.map((id, k) => id ? `<section class="pane ${id === S.focusDoc ? 'focus' : ''}" data-pane="${k}"><div class="pane-h"><div class="pn">${fileIcon(item(id), 18)}<span class="ell">${esc(item(id).name)}</span>${ic('chevDown', 14)}<select data-pane-sel="${k}" aria-label="Trocar documento">${S.open.map(o => `<option value="${o}" ${o === id ? 'selected' : ''}>${esc(item(o).name)}</option>`).join('')}</select></div><button class="ib xs" data-act="closePane" data-k="${k}" aria-label="Fechar painel">${ic('close', 14)}</button></div>
       <div class="doc-scroll tool-${S.tool}" data-doc="${id}" data-edit="1" data-pane-i="${k}"><div class="pages"></div></div><div class="pane-f"><button data-act="pgp" data-k="${k}" data-d="-1">${ic('arrowL', 16)}</button><span id="pc${k}">–</span><button data-act="pgp" data-k="${k}" data-d="1">${ic('arrowR', 16)}</button></div></section>`
       : `<section class="pane empty-pane"><p>Abra outro arquivo para comparar</p><button class="btn sm" data-act="addTab">Abrir arquivo</button></section>`).join('')}</div></div>${toolbarHTML(fd)}</div>`;
   }
@@ -824,7 +834,7 @@ function openDocs(ids, mode = 'tabs') {
   if (mode === 'float') { ids.forEach(openFloat); render(); toast(`${ids.length} arquivo(s) em janelas flutuantes`, {sub: 'Arraste pela barra e redimensione pelo canto'}); return; }
   ids.forEach(id => { if (!S.open.includes(id)) S.open.push(id); });
   S.active = ids[0];
-  if (mode === 'split') { S.layout = 'split'; S.split = ids.slice(0, 2); S.focusDoc = ids[0]; } else S.layout = 'tabs';
+  if (mode === 'split') { S.layout = 'split'; S.split = ids.slice(0, splitMax()); S.focusDoc = ids[0]; } else S.layout = 'tabs';
   S.screen = 'viewer'; S.vmode = 'main'; S.tool = 'hand'; render();
 }
 function closeDoc(id) { S.open = S.open.filter(x => x !== id); S.floats = S.floats.filter(f => f.doc !== id); if (S.active === id) S.active = S.open[0] || null; }
@@ -888,7 +898,26 @@ async function buildPdfBlob(it) {
   }
   return doc.output('blob');
 }
+async function flattenPdf(it, bytes) {
+  const {PDFDocument, rgb, StandardFonts} = window.PDFLib, doc = await PDFDocument.load(bytes, {ignoreEncryption: true});
+  const bold = await doc.embedFont(StandardFonts.HelveticaBold), reg = await doc.embedFont(StandardFonts.Helvetica), pages = doc.getPages();
+  const hex = h => { const n = parseInt(String(h || '#e5322d').slice(1), 16); return rgb((n >> 16) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255); };
+  const safe = t => String(t).replace(/[^\u0000-\u00ff]/g, '?');
+  for (const a of it.ann || []) {
+    const pg = pages[a.page - 1]; if (!pg) continue;
+    const {width: W, height: H} = pg.getSize(), X = v => v / 100 * W, Y = v => H - v / 100 * H;
+    try {
+      if (a.type === 'hl') pg.drawRectangle({x: X(a.x), y: Y(a.y + a.h), width: a.w / 100 * W, height: a.h / 100 * H, color: rgb(1, .84, 0), opacity: .35});
+      else if (a.type === 'text') pg.drawText(safe(a.text), {x: X(a.x), y: Y(a.y) - 4, size: 12, font: bold, color: rgb(.82, .14, .17), maxWidth: W * .6, lineHeight: 14});
+      else if (a.type === 'note') { pg.drawCircle({x: X(a.x), y: Y(a.y), size: 6, color: rgb(.98, .75, .14)}); pg.drawText(safe('Nota: ' + a.text), {x: X(a.x) + 9, y: Y(a.y) - 3, size: 8, font: reg, color: rgb(.12, .31, .75), maxWidth: W * .4, lineHeight: 10}); }
+      else if (a.type === 'ink') for (let i = 1; i < a.pts.length; i++) pg.drawLine({start: {x: X(a.pts[i - 1][0]), y: Y(a.pts[i - 1][1])}, end: {x: X(a.pts[i][0]), y: Y(a.pts[i][1])}, thickness: 1.8, color: hex(a.c)});
+      else if (a.src) { const img = a.src.startsWith('data:image/png') ? await doc.embedPng(a.src) : await doc.embedJpg(a.src), w = a.w / 100 * W, h = w * (a.ar || .4); pg.drawImage(img, {x: X(a.x), y: Y(a.y) - h, width: w, height: h}); }
+    } catch (e) { console.warn('anotação ignorada', e); }
+  }
+  return new Blob([await doc.save()], {type: 'application/pdf'});
+}
 async function fileBlob(it) {
+  if (it.source === 'idb' && it.ext === 'pdf' && (it.ann || []).length && window.PDFLib) { const b = await IDB.get(it.id); if (b) { try { return await flattenPdf(it, b); } catch (e) { console.warn(e); } } }
   if (it.source === 'idb') { const b = await IDB.get(it.id); return b ? new Blob([b], {type: it.mime || (it.ext === 'pdf' ? 'application/pdf' : 'application/octet-stream')}) : null; }
   if (kindOf(it) === 'txt') return new Blob([it.content || ''], {type: 'text/plain'});
   return buildPdfBlob(it);
@@ -925,6 +954,50 @@ async function docText(it) {
   const out = []; for (let p = 1; p <= (it.pages || 1); p++) out.push(blocksFor(it, p).map(blockText).join('\n\n')); return out.join('\n\n— — —\n\n');
 }
 function addFile(o) { const it = {id: uid(), type: 'file', created: Date.now(), modified: Date.now(), ann: [], ...o}; it.name = uniqueName(it.name, it.parent); S.fs.items.push(it); saveFS(); S.flash = [it.id]; return it; }
+/* ---------- gerador de .docx (Word) sem bibliotecas: zip simples + WordprocessingML ---------- */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = b => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+function zipStore(files) {
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), data = typeof f.data === 'string' ? enc.encode(f.data) : f.data, crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30)); h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true); h.setUint16(10, 0, true); h.setUint16(12, 0x21, true); h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, name.length, true); h.setUint16(28, 0, true);
+    parts.push(new Uint8Array(h.buffer), name, data);
+    const c = new DataView(new ArrayBuffer(46)); c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true); c.setUint16(12, 0, true); c.setUint16(14, 0x21, true); c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, name.length, true); c.setUint32(42, off, true);
+    central.push(new Uint8Array(c.buffer), name); off += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((a, b) => a + b.length, 0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cdSize, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, new Uint8Array(e.buffer)], {type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'});
+}
+async function buildDocx(it) {
+  const X = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  const par = (t, {b = false, sz = 22, color = '', after = 120} = {}) => `<w:p><w:pPr><w:spacing w:after="${after}"/></w:pPr><w:r><w:rPr>${b ? '<w:b/>' : ''}<w:sz w:val="${sz}"/>${color ? `<w:color w:val="${color}"/>` : ''}</w:rPr><w:t xml:space="preserve">${X(t)}</w:t></w:r></w:p>`;
+  const brk = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+  const body = []; const n = kindOf(it) === 'txt' ? 1 : it.pages || 1;
+  if (it.source === 'idb' || kindOf(it) === 'txt') {
+    const txt = await docText(it); body.push(par(titleOf(it), {b: true, sz: 36, after: 240}));
+    txt.split(/\n{2,}/).forEach((pg, i) => { if (i) body.push(brk); pg.split(/\n/).forEach(l => l.trim() && body.push(par(l.trim()))); });
+  } else for (let p = 1; p <= n; p++) {
+    if (p > 1) body.push(brk);
+    for (const b of blocksFor(it, p)) {
+      if (b.t === 'title') body.push(par(b.x, {b: true, sz: 40, after: 80}));
+      else if (b.t === 'sub') body.push(par(b.x, {sz: 18, color: '8A93A6', after: 280}));
+      else if (b.t === 'h') body.push(par(b.x, {b: true, sz: 28, after: 120}));
+      else if (b.t === 'ul') b.items.forEach(x => body.push(par('•  ' + x)));
+      else if (b.t === 'tbl') body.push(`<w:tbl><w:tblPr><w:tblBorders><w:insideH w:val="single" w:sz="4" w:color="D9DFEA"/><w:bottom w:val="single" w:sz="4" w:color="D9DFEA"/></w:tblBorders><w:tblW w:w="5000" w:type="pct"/></w:tblPr>${b.rows.map((r, i) => `<w:tr>${r.map(c => `<w:tc><w:p><w:r><w:rPr>${i ? '' : '<w:b/>'}</w:rPr><w:t xml:space="preserve">${X(c)}</w:t></w:r></w:p></w:tc>`).join('')}</w:tr>`).join('')}</w:tbl>`, par(''));
+      else { body.push(par(b.x)); if (b.cap) body.push(par('[' + b.cap + ']', {sz: 18, color: '8A93A6'})); }
+    }
+  }
+  const notes = (it.ann || []).filter(a => a.text);
+  if (notes.length) { body.push(brk, par('Anotações feitas no BOM!', {b: true, sz: 28})); notes.forEach(a => body.push(par(`Página ${a.page} · ${a.type === 'note' ? 'Comentário' : 'Texto'}: ${a.text}${a.quote ? ` (sobre “${a.quote}”)` : ''}`))); }
+  const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body.join('')}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  return zipStore([
+    {name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'},
+    {name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'},
+    {name: 'word/document.xml', data: doc}
+  ]);
+}
 async function convert(id, to) {
   const it = item(id), base = baseName(it.name), k = kindOf(it);
   try {
@@ -937,6 +1010,9 @@ async function convert(id, to) {
       const c = document.createElement('canvas'); c.width = im.naturalWidth; c.height = im.naturalHeight; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(im, 0, 0);
       const doc = new window.jspdf.jsPDF({unit: 'pt', format: [c.width, c.height], orientation: c.width > c.height ? 'l' : 'p'}); doc.addImage(c.toDataURL('image/jpeg', .9), 'JPEG', 0, 0, c.width, c.height);
       const buf = await doc.output('blob').arrayBuffer(); out = addFile({ext: 'pdf', name: base + '.pdf', parent: it.parent, size: buf.byteLength, source: 'idb', mime: 'application/pdf', pages: 1}); await IDB.put(out.id, buf);
+    } else if (to === 'docx') {
+      const blob = await buildDocx(it), buf = await blob.arrayBuffer();
+      out = addFile({ext: 'docx', name: base + '.docx', parent: it.parent, size: buf.byteLength, source: 'idb', mime: blob.type}); await IDB.put(out.id, buf);
     } else if (to === 'png') {
       const pdf = await getPdf(id), pg = await pdf.getPage(1), vp = pg.getViewport({scale: 1.6}), c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
       await pg.render({canvasContext: c.getContext('2d'), viewport: vp}).promise;
@@ -950,8 +1026,8 @@ async function convert(id, to) {
 function convertSheet(id) {
   const it = item(id), k = kindOf(it), idb = it.source === 'idb';
   const opt = (to, icn, l, ok, why) => `<button class="mi" data-act="doConvert" data-id="${id}" data-to="${to}" ${ok ? '' : 'disabled'}>${ic(icn)}<span>${l}${ok ? '' : `<br><small class="muted">${why}</small>`}</span></button>`;
-  const opts = k === 'pdf' ? opt('txt', 'text', 'Texto (.txt)', true) + opt('png', 'image', 'Imagem PNG (página 1)', idb, 'Disponível para PDFs importados') + opt('docx', 'newdoc', 'Word (.docx)', false, 'Ainda não disponível')
-    : k === 'img' ? opt('pdf', 'page', 'PDF (.pdf)', true) : k === 'txt' ? opt('pdf', 'page', 'PDF (.pdf)', true) : '<p class="muted">Este formato não pode ser convertido no app.</p>';
+  const opts = k === 'pdf' ? opt('txt', 'text', 'Texto (.txt)', true) + opt('png', 'image', 'Imagem PNG (página 1)', idb, 'Disponível para PDFs importados') + opt('docx', 'newdoc', 'Word (.docx)', true)
+    : k === 'img' ? opt('pdf', 'page', 'PDF (.pdf)', true) : k === 'txt' ? opt('pdf', 'page', 'PDF (.pdf)', true) + opt('docx', 'newdoc', 'Word (.docx)', true) : '<p class="muted">Este formato não pode ser convertido no app.</p>';
   openSheet(`<h3>Converter “${esc(it.name)}”</h3>${opts}`);
 }
 function itemMenuHTML(id) {
@@ -1047,26 +1123,29 @@ function vAbertos() {
   <div class="box"><h4>Multitarefa</h4><div class="muted small" style="line-height:1.7">• Selecione vários arquivos e toque em <b>Abrir</b> para escolher abas, janelas flutuantes ou tela dividida.<br>• Cada aba guarda a página onde você parou.<br>• Janelas flutuantes podem ser movidas pela barra e redimensionadas pelo canto.</div></div></div></div>`;
 }
 function vAcessos() {
-  const s = LS.get('bom_session', null), logs = getLogs().filter(l => l.uid === S.user.uid).sort((a, b) => b.dataLogin.localeCompare(a.dataLogin)), u = getUsers().find(x => x.uid === S.user.uid) || S.user;
-  return `<div class="screen">${menuBar('Meus acessos', `${logs.length} registro(s) no histórico`)}<div class="scroll pad">
-    ${logs.map(l => { const me = s && l.idLog === s.logId; return `<div class="lrow"><div class="ldate"><b>${fmtD(l.dataLogin)}</b><small class="ell">${esc(l.nomeDispositivo)}</small></div><div class="ltimes"><span>Login <b>${fmtT(l.dataLogin)}</b></span><span>Logout <b>${l.horaLogout ? fmtT(l.horaLogout) : '—'}</b></span></div><span class="pill ${l.situacao}">${me ? 'Esta sessão' : l.situacao === 'ativa' ? 'Ativa' : 'Encerrada'}</span></div>`; }).join('') || '<div class="empty">Sem registros.</div>'}
-    <div class="box" style="margin-top:6px"><h4>Dispositivos usados</h4>${(u.dispositivos || []).map(d => `<div class="drow"><div><b style="font-weight:500">${esc(d.nomeDispositivo)}</b><br><small>${esc(d.plataforma)}${d.idDispositivo === deviceInfo().idDispositivo ? ' · este aparelho' : ''}</small></div><small>Último acesso<br>${fmtD(d.ultimoAcesso)} ${fmtT(d.ultimoAcesso)}</small></div>`).join('')}</div></div></div>`;
+  const s = LS.get('bom_session', null);
+  const logs = need('myLogs', () => BOM.LogAcesso.listarDoUsuario(S.user.uid)), devs = need('myDevs', () => BOM.Dispositivo.listar(S.user.uid));
+  const body = !logs ? loadingBox() : logs.erro ? errBox(logs.erro) : logs.map(l => { const me = s && l.idLog === s.logId; return `<div class="lrow"><div class="ldate"><b>${fmtD(l.dataLogin)}</b><small class="ell">${esc(l.nomeDispositivo)}</small></div><div class="ltimes"><span>Login <b>${fmtT(l.dataLogin)}</b></span><span>Logout <b>${l.horaLogout ? fmtT(l.horaLogout) : '—'}</b></span></div><span class="pill ${l.situacao}">${me ? 'Esta sessão' : l.situacao === 'ativa' ? 'Ativa' : 'Encerrada'}</span></div>`; }).join('') || '<div class="empty">Sem registros.</div>';
+  const dv = !devs ? loadingBox() : devs.erro ? errBox(devs.erro) : devs.map(d => `<div class="drow"><div><b style="font-weight:500">${esc(d.nomeDispositivo)}</b><br><small>${esc(d.plataforma)}${d.idDispositivo === deviceInfo().idDispositivo ? ' · este aparelho' : ''}</small></div><small>Último acesso<br>${d.ultimoAcesso ? fmtD(d.ultimoAcesso) + ' ' + fmtT(d.ultimoAcesso) : '—'}</small></div>`).join('');
+  return `<div class="screen">${menuBar('Meus acessos', logs && !logs.erro ? `${logs.length} registro(s) no histórico · ${BOM.nuvem ? 'nuvem' : 'este aparelho'}` : '')}<div class="scroll pad">${body}
+    <div class="box" style="margin-top:6px"><h4>Dispositivos usados</h4>${dv}</div></div></div>`;
 }
 function vConta() {
   const u = S.user, rem = LS.get('bom_lembrar', null), files = S.fs.items.filter(i => i.type !== 'folder' && !i.trashed);
   return `<div class="screen">${menuBar('Conta')}<div class="scroll pad">
     <div class="box prof"><div class="avatar" style="width:56px;height:56px">${esc(u.nome.split(' ').map(x => x[0]).slice(0, 2).join('').toUpperCase())}</div><div class="ometa"><b style="font-size:17px;font-weight:500">${esc(u.nome)}</b><small>${esc(u.email)}</small><small>${u.perfil === 'admin' ? 'Administrador' : 'Usuário'} · desde ${fmtD(u.dataCadastro)}</small></div></div>
-    <div class="box"><h4>Neste aparelho</h4><div class="drow"><span>Sessão</span><small>Salva: o app abre direto, sem novo login</small></div><div class="drow"><span>E-mail e senha</span><small>${rem ? 'Salvos para o próximo login' : 'Não salvos'}</small></div><div class="drow"><span>Arquivos locais</span><small>${files.length} arquivo(s) · ${fmtSize(files.reduce((a, b) => a + (b.size || 0), 0))}</small></div>
+    <div class="box"><h4>Neste aparelho</h4><div class="drow"><span>Armazenamento da conta</span><small>${BOM.nuvem ? `Nuvem (${BOM.provedor}): entra em qualquer dispositivo` : 'Modo local: só neste aparelho'}</small></div><div class="drow"><span>Sessão</span><small>Salva: o app abre direto, sem novo login</small></div><div class="drow"><span>${BOM.nuvem ? 'E-mail' : 'E-mail e senha'}</span><small>${rem ? 'Salvo para o próximo login' : 'Não salvo'}</small></div><div class="drow"><span>Arquivos locais</span><small>${files.length} arquivo(s) · ${fmtSize(files.reduce((a, b) => a + (b.size || 0), 0))}</small></div>
       ${rem ? `<button class="chip" style="margin-top:8px" data-act="forgetCreds">Esquecer e-mail e senha salvos</button>` : ''}</div>
     <div class="box"><h4>Preferências</h4><div class="drow"><span>Exibição dos arquivos</span><button class="chip" data-act="toggleView">${S.view === 'grid' ? 'Grade' : 'Lista'}</button></div><div class="drow"><span>Leitura noturna</span><button class="chip ${S.night ? 'on' : ''}" data-act="toggleNight">${S.night ? 'Ligada' : 'Desligada'}</button></div></div>
     ${u.perfil === 'admin' ? `<button class="btn ghost block" style="margin-bottom:10px" data-act="go" data-to="admin">${ic('shield')} Painel do administrador</button>` : ''}
     <button class="btn block danger" data-act="logout">${ic('logout')} Sair</button><p class="muted small center">Ao sair, a hora de logout é gravada no seu histórico de acessos.</p></div></div>`;
 }
 function vAdmin() {
-  const users = getUsers(), logs = getLogs(), f = S.af;
+  const f = S.af, ad = need('adm', async () => { const users = await BOM.Usuario.listar(), logs = await BOM.LogAcesso.listarTodos(); const devs = await Promise.all(users.map(u => BOM.Dispositivo.listar(u.uid).catch(() => []))); users.forEach((u, i) => u.nDisp = devs[i].length); return {users, logs}; });
+  const users = ad && !ad.erro ? ad.users : [], logs = ad && !ad.erro ? ad.logs : [];
   const side = `<aside><div class="abrand">${logo(120)}<small>ADMIN</small></div>
     <button class="anav ${S.adminTab === 'log' ? 'on' : ''}" data-act="adminTab" data-tab="log">${ic('list', 20)} Log de acessos</button><button class="anav ${S.adminTab === 'users' ? 'on' : ''}" data-act="adminTab" data-tab="users">${ic('users', 20)} Usuários</button>
-    <div class="aspace"></div><button class="anav" data-act="go" data-to="home">${ic('folder', 20)} Abrir o app</button><button class="anav" data-act="logout">${ic('logout', 20)} Sair</button></aside>`;
+    <div class="aspace"></div><div class="muted small" style="padding:8px 12px">${BOM.nuvem ? `● Conectado ao ${BOM.provedor}` : '● Modo local (este aparelho)'}</div><button class="anav" data-act="reloadAdm">${ic('restore', 20)} Atualizar dados</button>${window.BOM_ADMIN_PAGE ? `<a class="anav" href="index.html">${ic('folder', 20)} Abrir o app</a>` : `<button class="anav" data-act="go" data-to="home">${ic('folder', 20)} Abrir o app</button>`}<button class="anav" data-act="logout">${ic('logout', 20)} Sair</button></aside>`;
   let main;
   if (S.adminTab === 'log') {
     const L = logs.filter(l => (!f.uid || l.uid === f.uid) && (!f.sit || l.situacao === f.sit) && (!f.de || ymd(l.dataLogin) >= f.de) && (!f.ate || ymd(l.dataLogin) <= f.ate)).sort((a, b) => b.dataLogin.localeCompare(a.dataLogin));
@@ -1079,9 +1158,10 @@ function vAdmin() {
   } else {
     main = `<h1>Usuários</h1><p class="lead">Ative ou desative contas. Contas desativadas não conseguem entrar no app.</p>
       <div class="tbl-wrap"><table class="t"><thead><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Cadastro</th><th>Dispositivos</th><th>Acessos</th><th>Situação</th></tr></thead><tbody>
-      ${users.map(u => `<tr><td>${esc(u.nome)}</td><td>${esc(u.email)}</td><td>${u.perfil === 'admin' ? 'Administrador' : 'Usuário'}</td><td>${fmtD(u.dataCadastro)}</td><td>${(u.dispositivos || []).length}</td><td>${logs.filter(l => l.uid === u.uid).length}</td>
+      ${users.map(u => `<tr><td>${esc(u.nome)}</td><td>${esc(u.email)}</td><td>${u.perfil === 'admin' ? 'Administrador' : 'Usuário'}</td><td>${fmtD(u.dataCadastro)}</td><td>${u.nDisp ?? 0}</td><td>${logs.filter(l => l.uid === u.uid).length}</td>
         <td><button class="tgl ${u.ativo ? 'on' : ''}" data-act="toggleUser" data-id="${u.uid}" ${u.uid === S.user.uid ? 'disabled title="Você não pode desativar a própria conta"' : ''} aria-label="Ativar ou desativar"></button> <span class="pill ${u.ativo ? 'ativa' : 'inativo'}">${u.ativo ? 'Ativa' : 'Inativa'}</span></td></tr>`).join('')}</tbody></table></div>`;
   }
+  if (!ad) main = `<h1>${S.adminTab === 'log' ? 'Log de acessos' : 'Usuários'}</h1>${loadingBox('Carregando dados…')}`; else if (ad.erro) main = `<h1>Painel do administrador</h1>${errBox(ad.erro)}`;
   return `<div class="screen"><div class="adm">${side}<main>${main}</main></div></div>`;
 }
 
@@ -1111,12 +1191,13 @@ const A = {
   go(el) {
     const to = el.dataset.to, s = LS.get('bom_session', null);
     if (s && to === 'admin') LS.set('bom_session', {...s, area: 'admin'}); if (s && to === 'home' && S.screen === 'admin') LS.set('bom_session', {...s, area: 'app'});
+    if (['acessos', 'admin'].includes(to)) { delete S.data.myLogs; delete S.data.myDevs; delete S.data.adm; }
     closeSheet(); S.select = false; S.sel.clear(); S.loginErr = ''; S.screen = to; render();
   },
   sec(el) { closeSheet(); Object.assign(S, {screen: 'home', section: el.dataset.sec, cwd: null, filter: '', searchOpen: false, tf: 'all', select: false}); S.sel.clear(); render(); },
   drawer() { openDrawer(); },
-  toAdmin() { S.adminIntent = true; S.loginErr = ''; try { history.replaceState(null, '', '#admin'); } catch (e) {} render(); },
-  toApp() { S.adminIntent = false; S.loginErr = ''; try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {} render(); },
+  toAdmin() { if (!NATIVE && !window.BOM_SINGLE) { location.href = 'admin.html'; return; } S.adminIntent = true; S.loginErr = ''; try { history.replaceState(null, '', '#admin'); } catch (e) {} render(); },
+  toApp() { if (window.BOM_ADMIN_PAGE) { location.href = 'index.html'; return; } S.adminIntent = false; S.loginErr = ''; try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {} render(); },
   logout() { logout(); },
   forgetCreds() { LS.del('bom_lembrar'); LS.set('bom_lembrar_off', true); render(); toast('E-mail e senha removidos deste aparelho'); },
   toggleSearch() { S.searchOpen = !S.searchOpen; if (!S.searchOpen) S.filter = ''; render(); if (S.searchOpen) setTimeout(() => $('#q') && $('#q').focus(), 30); },
@@ -1163,7 +1244,7 @@ const A = {
   floatItem(el) { openDocs([el.dataset.id], 'float'); },
   shareItem(el) { shareSheet([el.dataset.id]); },
   convertItem(el) { convertSheet(el.dataset.id); },
-  doConvert(el) { closeSheet(); if (el.dataset.to !== 'docx') convert(el.dataset.id, el.dataset.to); },
+  doConvert(el) { closeSheet(); convert(el.dataset.id, el.dataset.to); },
   doShare(el) { closeSheet(); shareOrDownload(el.dataset.ids.split(',')); },
   doDownload(el) { closeSheet(); shareOrDownload(el.dataset.ids.split(','), true); },
   renameItem(el) { renameItem(el.dataset.id); },
@@ -1184,7 +1265,7 @@ const A = {
   tab(el) { S.active = el.dataset.id; S.layout = 'tabs'; render(); },
   closeTab(el, e) { e.stopPropagation(); closeDoc(el.dataset.id); render(); },
   addTab() { const files = S.fs.items.filter(i => i.type !== 'folder' && alive(i) && kindOf(i) !== 'other' && !S.open.includes(i.id)).sort((a, b) => a.name.localeCompare(b.name, 'pt-BR')); openSheet(`<h3>Abrir outro arquivo</h3><div class="plist">${files.map(f => `<button class="prow" data-act="addTabPick" data-id="${f.id}">${fileIcon(f, 30)}<span class="ell">${esc(f.name)}</span></button>`).join('') || '<p class="muted">Todos os arquivos já estão abertos.</p>'}</div>`); },
-  addTabPick(el) { const id = el.dataset.id; closeSheet(); S.open.push(id); item(id).opened = Date.now(); if (S.layout === 'split') { const a = splitIds().filter(Boolean); S.split = [a[0], id]; S.focusDoc = id; } else S.active = id; render(); },
+  addTabPick(el) { const id = el.dataset.id; closeSheet(); S.open.push(id); item(id).opened = Date.now(); if (S.layout === 'split') { const a = splitIds().filter(Boolean); S.split = a.length < splitMax() ? [...a, id] : [...a.slice(0, -1), id]; S.focusDoc = id; } else S.active = id; render(); },
   toggleSplit() { closeSheet(); S.layout = S.layout === 'split' ? 'tabs' : 'split'; if (S.layout === 'split') { S.split = [S.active, ...(S.split || []).filter(x => x !== S.active)]; S.focusDoc = S.active; } render(); },
   splitDir() { S.splitDir = S.splitDir === 'cols' ? 'rows' : 'cols'; render(); },
   closePane(el) { const ids = splitIds(), gone = ids[+el.dataset.k]; S.split = ids.filter(x => x && x !== gone); if (S.split.length < 1) { S.layout = 'tabs'; } else if (!S.open.some(o => !S.split.includes(o))) { S.layout = 'tabs'; S.active = S.split[0]; } render(); },
@@ -1243,12 +1324,13 @@ const A = {
   // admin
   adminTab(el) { S.adminTab = el.dataset.tab; render(); },
   clearAF() { S.af = {uid: '', de: '', ate: '', sit: ''}; render(); },
-  toggleUser(el) {
-    if (el.disabled) return;
-    const users = getUsers(), u = users.find(x => x.uid === el.dataset.id); if (!u) return;
-    u.ativo = !u.ativo; setUsers(users);
-    if (!u.ativo) { const logs = getLogs(); logs.filter(l => l.uid === u.uid && l.situacao === 'ativa').forEach(l => { l.situacao = 'encerrada'; l.horaLogout = new Date().toISOString(); }); setLogs(logs); }
-    render(); toast(`Conta de ${esc(u.nome)} ${u.ativo ? 'ativada' : 'desativada'}`);
+  reloadAdm() { delete S.data.adm; render(); },
+  async toggleUser(el) {
+    if (el.disabled) return; el.disabled = true;
+    const ad = S.data.adm, u = ad && ad.users && ad.users.find(x => x.uid === el.dataset.id); if (!u) return;
+    try { await BOM.Usuario.definirAtivo(u.uid, !u.ativo); if (u.ativo) await BOM.LogAcesso.encerrarAtivosDe(u.uid); }
+    catch (e) { el.disabled = false; return toast('Não foi possível alterar a conta', {sub: esc(e.message), err: true}); }
+    toast(`Conta de ${esc(u.nome)} ${u.ativo ? 'desativada' : 'ativada'}`); delete S.data.adm; render();
   }
 };
 IC.select = '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12l3 3 5-6"/>';
@@ -1298,8 +1380,8 @@ $('#selpop').addEventListener('pointerdown', e => e.preventDefault());
 $('#selpop').addEventListener('mousedown', e => e.preventDefault());
 document.addEventListener('submit', e => {
   e.preventDefault(); const f = e.target, fd = new FormData(f);
-  if (f.dataset.form === 'login') doLogin(fd);
-  else if (f.dataset.form === 'cadastro') doCadastro(fd);
+  if (f.dataset.form === 'login') doLogin(fd, f);
+  else if (f.dataset.form === 'cadastro') doCadastro(fd, f);
   else if (f.dataset.form === 'create') {
     const titulo = String(fd.get('titulo') || '').trim().replace(/[\\/:*?"<>|]/g, ''), conteudo = String(fd.get('conteudo') || ''); if (!titulo) return;
     const it = addFile({ext: 'pdf', name: titulo + '.pdf', parent: S.cwd || null, source: 'created', content: conteudo});
@@ -1322,21 +1404,24 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'Escape') { if ($('#overlay').classList.contains('show')) closeSheet(); else if (S.select) A.toggleSelect(); }
 });
-window.addEventListener('beforeunload', () => { try { if (S.fs && S.user) LS.set(fsKey(), S.fs); } catch (e) {} });
+window.addEventListener('beforeunload', () => { try { if (S.fs && S.user) BOM.ArquivosLocais.salvar(S.user.uid, S.fs); } catch (e) {} });
 const DESK = window.matchMedia('(min-width: 900px)');
 const isDesk = () => DESK.matches;
 try { DESK.addEventListener('change', () => { closeSheet(); render(); }); } catch (e) { DESK.addListener(() => render()); }
 
 /* ---------- início ---------- */
 (async function init() {
+  $('#app').innerHTML = `<div class="screen" style="display:grid;place-items:center">${logo(200)}</div>`;
+  await BOM.iniciar();
   await seed();
-  if (location.hash === '#admin') S.adminIntent = true;
-  const s = LS.get('bom_session', null);
-  if (s) {
-    const u = getUsers().find(x => x.uid === s.uid);
-    if (u && u.ativo) { S.user = u; loadFS(); loadPrefs(); S.screen = s.area === 'admin' && u.perfil === 'admin' ? 'admin' : 'home'; } // sessão salva: entra direto, sem novo registro no log
-    else { closeLog(s.logId); LS.del('bom_session'); if (u) S.loginErr = 'Sua conta foi desativada pelo administrador.'; }
-  }
+  if (location.hash === '#admin' || window.BOM_ADMIN_PAGE) S.adminIntent = true;
+  const s = LS.get('bom_session', null), atual = await BOM.Autenticacao.usuarioAtual();
+  if (s && atual === s.uid) {
+    let u = null; try { u = await BOM.Usuario.obter(atual); } catch (e) { console.warn(e); }
+    if (u && u.ativo && (!window.BOM_ADMIN_PAGE || u.perfil === 'admin')) { S.user = u; loadFS(); loadPrefs(); S.screen = (window.BOM_ADMIN_PAGE || (s.area === 'admin' && (NATIVE || window.BOM_SINGLE))) && u.perfil === 'admin' ? 'admin' : 'home'; } // sessão salva: entra direto, sem novo registro no log
+    else if (u && !u.ativo) { await BOM.LogAcesso.fechar(s.logId); await BOM.Autenticacao.sair(); LS.del('bom_session'); S.loginErr = 'Sua conta foi desativada pelo administrador.'; }
+  } else if (s) LS.del('bom_session');
+  else if (atual) await BOM.Autenticacao.sair();
   render();
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
   if (!storageOk()) setTimeout(() => toast('Este navegador não está salvando os dados', {sub: 'Modo anônimo ou visualização do arquivo. Abra no Chrome/Edge ou use o app.', err: true}), 600);

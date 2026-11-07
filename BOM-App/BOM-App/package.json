@@ -18,7 +18,10 @@
     "@capacitor/filesystem": "^6.0.0",
     "@capacitor/share": "^6.0.0",
     "jspdf": "2.5.1",
-    "pdfjs-dist": "3.11.174"
+    "pdfjs-dist": "3.11.174",
+    "pdf-lib": "1.17.1",
+    "firebase": "10.12.2",
+    "@supabase/supabase-js": "^2.45.0"
   },
   "devDependencies": {
     "@capacitor/assets": "^3.0.5",

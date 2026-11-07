@@ -419,3 +419,5 @@ body.desk .auth-card{justify-content:center;padding:60px 6vw;max-width:520px;wid
 body.desk .auth-h{display:block}
 body.desk .auth-back .auth-h{display:block}
 .auth-back .auth-h{display:block;font-size:21px}
+.split.cols{grid-template-columns:repeat(var(--n,2),minmax(0,1fr))}
+.split.rows{grid-template-rows:repeat(var(--n,2),minmax(0,1fr))}

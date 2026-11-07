@@ -11,6 +11,12 @@ O código das telas é o mesmo da versão web e fica em `www/`.
 - O **botão voltar** do Android fecha menus, sai da seleção, volta de pasta e, na tela inicial, fecha o app.
 - Tem ícone e tela de abertura com a logo do BOM!.
 
+## Nuvem (Supabase ou Firebase)
+O app já vem pronto para guardar contas e log na nuvem (login em qualquer dispositivo).
+- **Supabase:** preencha `www/js/supabase-config.js`. Passo a passo em **CONFIGURAR-SUPABASE.md** (tabelas e regras em `supabase/schema.sql`).
+- **Firebase:** preencha `www/js/firebase-config.js`. Passo a passo em **CONFIGURAR-FIREBASE.md**.
+Com os dois em `null`, ele roda no modo local.
+
 ## Estrutura
 ```
 BOM-App/
